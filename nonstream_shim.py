@@ -7,7 +7,9 @@ finish_reason) and is several times slower than a plain request. This shim takes
 response as server-sent events. Keepalive comments go out while the model works so clients do not
 time out. Other requests are passed through unchanged. Standard library only.
 
-Usage: nonstream_shim.py <upstream_base_url> <port>
+Usage: nonstream_shim.py <routes.json> <port>
+routes.json maps a model name to its upstream base URL. Requests arrive as /<model-name>/v1/... and are
+forwarded to that model's upstream, so public and custom endpoints can share one shim.
 The Authorization header from the caller is forwarded; the key is never read from disk or logged.
 """
 import json
@@ -18,17 +20,34 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-UPSTREAM = sys.argv[1].rstrip("/")
+ROUTES_FILE = sys.argv[1]
 PORT = int(sys.argv[2])
 KEEPALIVE_SECS = 10
 UPSTREAM_TIMEOUT = 1800
 
 
-def call_upstream(method, path, body, auth):
+def resolve(path):
+    """'/<model>/v1/chat/completions' -> (upstream_base_url, '/chat/completions') or (None, None)."""
+    try:
+        with open(ROUTES_FILE) as f:
+            routes = json.load(f)
+    except (OSError, ValueError):
+        return None, None
+    parts = path.split("?", 1)[0].lstrip("/").split("/", 1)
+    base = routes.get(parts[0])
+    if base is None:
+        return None, None
+    rest = "/" + parts[1] if len(parts) > 1 else "/"
+    if rest.startswith("/v1/") or rest == "/v1":
+        rest = rest[3:] or "/"
+    return base.rstrip("/"), rest
+
+
+def call_upstream(method, base, path, body, auth):
     headers = {"Content-Type": "application/json"}
     if auth:
         headers["Authorization"] = auth
-    req = urllib.request.Request(UPSTREAM + path, body, headers, method=method)
+    req = urllib.request.Request(base + path, body, headers, method=method)
     try:
         r = urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT)
         return r.status, r.headers.get("Content-Type", "application/json"), r.read()
@@ -85,20 +104,24 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        status, ctype, data = call_upstream("GET", self.path.replace("/v1", "", 1) if self.path.startswith("/v1/") else self.path,
-                                            None, self.headers.get("Authorization"))
+        base, path = resolve(self.path)
+        if base is None:
+            return self._send(404, "application/json", b'{"error":"unknown model route"}')
+        status, ctype, data = call_upstream("GET", base, path, None, self.headers.get("Authorization"))
         self._send(status, ctype, data)
 
     def do_POST(self):
         raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         auth = self.headers.get("Authorization")
-        path = self.path.replace("/v1", "", 1) if self.path.startswith("/v1/") else self.path
+        base, path = resolve(self.path)
+        if base is None:
+            return self._send(404, "application/json", b'{"error":"unknown model route"}')
         try:
             req = json.loads(raw)
         except ValueError:
             req = None
         if not (path.endswith("/chat/completions") and isinstance(req, dict) and req.get("stream")):
-            status, ctype, data = call_upstream("POST", path, raw, auth)
+            status, ctype, data = call_upstream("POST", base, path, raw, auth)
             return self._send(status, ctype, data)
 
         want_usage = bool((req.get("stream_options") or {}).get("include_usage"))
@@ -119,7 +142,7 @@ class Handler(BaseHTTPRequestHandler):
         result = {}
 
         def work():
-            result["r"] = call_upstream("POST", path, body, auth)
+            result["r"] = call_upstream("POST", base, path, body, auth)
 
         t = threading.Thread(target=work, daemon=True)
         t.start()

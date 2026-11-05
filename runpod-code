@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # runpod-code: run the Claude Code CLI on Kimi models from a Runpod Public Endpoint.
-# Models and prices live in models.json next to this script.
+# Models and prices live in models.json next to this script; your own endpoints are saved to
+# ~/.config/runpod-code/models.json (override with RUNPOD_CODE_USER_MODELS).
 #
 #   runpod-code setup  [--yes] [--save-key] [--skip-validate] [--no-install]
 #   runpod-code claude [--model ID] [claude args...]
 #   runpod-code models [--live]
+#   runpod-code endpoint add [ID_OR_URL] [--name NAME] [--model SERVED_NAME] [--force] [--skip-check]
+#   runpod-code endpoint list | remove NAME
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,6 +25,13 @@ warn() { echo "warning: $*" >&2; }
 [ -f "$MODELS_JSON" ] || die "models file not found: $MODELS_JSON"
 command -v python3 >/dev/null 2>&1 || die "python3 is required but was not found"
 command -v curl >/dev/null 2>&1 || die "curl is required but was not found"
+
+# Built-in models plus any custom endpoints the user added. All later steps read the merged file.
+USER_MODELS="${RUNPOD_CODE_USER_MODELS:-${XDG_CONFIG_HOME:-$HOME/.config}/runpod-code/models.json}"
+BUILTIN_JSON="$MODELS_JSON"
+MODELS_JSON="$PROXY_HOME/models.merged.json"; ROUTES_JSON="$PROXY_HOME/routes.json"
+mkdir -p "$PROXY_HOME"
+python3 -I "$DIR/endpoint_tool.py" merge "$BUILTIN_JSON" "$USER_MODELS" "$MODELS_JSON" "$ROUTES_JSON" || die "could not read the models files"
 
 jget() { python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$MODELS_JSON" "$1"; }
 BASE_URL="$(jget base_url)"
@@ -164,7 +174,8 @@ print(f"{'id':26} {'in/out $/1M':>13}  {'cache read':>10}  status")
 for x in m["models"]:
     c = x["cost"]; cr = c.get("cache_read")
     star = " (default)" if x["id"] == m["default"] else ""
-    print(f"{x['id']:26} {c['input']:>5}/{c['output']:<7}  {('-' if cr is None else cr):>10}  {x['status']}{star}")
+    price = f"{c['input']:>5}/{c['output']:<7}" if x.get("source") != "custom" else f"{'GPU-seconds':>13}"
+    print(f"{x['id']:26} {price}  {('-' if cr is None else cr):>10}  {x['status']}{star}")
 PY
   if [ "${1:-}" = "--live" ]; then
     load_saved_key || true
@@ -172,7 +183,7 @@ PY
     auth_curl "$BASE_URL/models" | python3 -I -c '
 import json, sys
 live = {x["id"] for x in json.load(sys.stdin)["data"]}
-known = {x["id"] for x in json.load(open(sys.argv[1]))["models"]}
+known = {x["id"] for x in json.load(open(sys.argv[1]))["models"] if x.get("source") != "custom"}
 print("\nlive endpoint models:", ", ".join(sorted(live)))
 for i in sorted(live - known): print("  NEW (not in models.json, no price):", i)
 for i in sorted(known - live): print("  MISSING from endpoint:", i)' "$MODELS_JSON"
@@ -195,9 +206,10 @@ for x in m["models"]:
               "    litellm_params:",
               # hosted_vllm (chat completions) on purpose: the openai/ prefix makes LiteLLM call
               # the /responses route, which this endpoint does not serve (502).
-              f"      model: hosted_vllm/{x['id']}",
-              # via nonstream_shim.py: Runpod's streaming path truncates long tool calls and is ~6x slower
-              f"      api_base: http://127.0.0.1:{os.environ['SHIM_PORT']}/v1",
+              f"      model: hosted_vllm/{x.get('upstream_model', x['id'])}",
+              # via nonstream_shim.py: Runpod's streaming path truncates long tool calls and is ~6x slower.
+              # The first path segment tells the shim which upstream this model uses.
+              f"      api_base: http://127.0.0.1:{os.environ['SHIM_PORT']}/{x['id']}/v1",
               "      api_key: os.environ/RUNPOD_API_KEY",
               f"      input_cost_per_token: {c['input']/1e6:.10f}",
               f"      output_cost_per_token: {c['output']/1e6:.10f}"]
@@ -241,6 +253,16 @@ proxy_handler_instance = StripThinking()
 PY
 }
 
+cmd_endpoint() {
+  local sub="${1:-}"; [ $# -gt 0 ] && shift
+  case "$sub" in
+    add|list|remove|rm)
+      [ "$sub" != add ] || load_saved_key || true
+      USER_MODELS="$USER_MODELS" BUILTIN_JSON="$BUILTIN_JSON" python3 -I "$DIR/endpoint_tool.py" "$sub" "$@" ;;
+    *) die "usage: runpod-code endpoint add [ID_OR_URL] | list | remove NAME" ;;
+  esac
+}
+
 cmd_claude() {
   local model="$DEFAULT_MODEL"
   if [ "${1:-}" = "--model" ]; then model="${2:?--model needs an id}"; shift 2; fi
@@ -269,8 +291,7 @@ cmd_claude() {
     ensure_litellm
     master="sk-$(python3 -I -c 'import secrets;print(secrets.token_hex(24))')"
     ( umask 077; printf '%s' "$master" > "$MASTER_FILE" )
-    BASE_URL="$(python3 -I -c 'import json,sys;print(json.load(open(sys.argv[1]))["base_url"])' "$MODELS_JSON")"
-    nohup python3 -I "$DIR/nonstream_shim.py" "$BASE_URL" "$SHIM_PORT" >"$PROXY_HOME/shim.log" 2>&1 &
+    nohup python3 -I "$DIR/nonstream_shim.py" "$ROUTES_JSON" "$SHIM_PORT" >"$PROXY_HOME/shim.log" 2>&1 &
     shim_pid=$!; disown "$shim_pid" 2>/dev/null || true   # no "Terminated" noise on exit
     write_litellm_config "$PROXY_HOME/litellm_config.yaml"
     # run from PROXY_HOME so LiteLLM can import strip_thinking.py next to the config
@@ -303,5 +324,6 @@ case "${1:-help}" in
   setup)  shift; cmd_setup "$@" ;;
   models) shift; cmd_models "$@" ;;
   claude) shift; cmd_claude "$@" ;;
-  *) sed -n '2,7p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+  endpoint) shift; cmd_endpoint "$@" ;;
+  *) sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
 esac

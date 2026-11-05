@@ -41,6 +41,22 @@ Claude Code's own cost readout is not reliable for Kimi. The proxy returns a per
 
 Models and prices live in `models.json`. Only `kimi-k3.1-pro` has been tested; the others are marked `untested`.
 
+## Use your own Runpod endpoint
+
+If the public endpoint is slow or busy, point Claude Code at a vLLM Serverless endpoint you run yourself:
+
+```bash
+./runpod-code endpoint add            # lists your endpoints; or pass an id: endpoint add <id>
+./runpod-code claude --model <name>   # the name it prints
+```
+
+`endpoint add` wakes the endpoint (a cold start can take several minutes), reads the model it serves, and tests the two things Claude Code needs before saving anything:
+
+- **Tool calling.** On the Runpod vLLM worker set `ENABLE_AUTO_TOOL_CHOICE=true` and `TOOL_CALL_PARSER` (for example `hermes` for Qwen). Without them the test fails and tells you what to change.
+- **A context window of at least 32k tokens.** Set `MAX_MODEL_LEN`. Claude Code's own instructions use about 16k.
+
+Your endpoints are saved in `~/.config/runpod-code/models.json` and appear in `./runpod-code models`. `endpoint list` and `endpoint remove <name>` manage them (removing only forgets it here). Serverless bills GPU-seconds on your account, so Claude Code's cost readout does not apply. Tested on one small Qwen model; quality depends on the model you choose.
+
 ## Good to know
 
 - Thinking is on by default. For faster, cheaper replies on easy tasks, turn it off with `RUNPOD_CODE_THINKING=off ./runpod-code claude`.
