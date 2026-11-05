@@ -13,6 +13,7 @@ ENV_FILE="${RUNPOD_CODE_ENV_FILE:-$HOME/.zshenv}"
 PROXY_HOME="${RUNPOD_CODE_HOME:-$HOME/.local/share/runpod-code}"
 VENV="${RUNPOD_CODE_VENV:-$PROXY_HOME/venv}"
 PORT="${RUNPOD_CODE_PORT:-4000}"
+SHIM_PORT="${RUNPOD_CODE_SHIM_PORT:-$((PORT + 1000))}"
 CLAUDE_BIN="${RUNPOD_CODE_CLAUDE_BIN:-claude}"
 
 die()  { echo "error: $*" >&2; exit 1; }
@@ -170,9 +171,12 @@ for i in sorted(known - live): print("  MISSING from endpoint:", i)' "$MODELS_JS
 proxy_healthy() { curl -s -m 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health/liveliness" 2>/dev/null | grep -q 200; }
 
 write_litellm_config() {  # $1 = output path
-  python3 -I - "$MODELS_JSON" "$1" <<'PY'
-import json, sys
+  SHIM_PORT="$SHIM_PORT" python3 -I - "$MODELS_JSON" "$1" <<'PY'
+import json, os, sys
 m = json.load(open(sys.argv[1])); out = sys.argv[2]
+# Thinking is OFF by default: with reasoning on, LiteLLM's Anthropic stream adapter silently ends many
+# streams after a few reasoning tokens ("stream was malformed"). Set RUNPOD_CODE_THINKING=on to enable.
+thinking_off = os.environ.get("RUNPOD_CODE_THINKING", "off") != "on"
 lines = ["model_list:"]
 for x in m["models"]:
     c = x["cost"]
@@ -181,10 +185,13 @@ for x in m["models"]:
               # hosted_vllm (chat completions) on purpose: the openai/ prefix makes LiteLLM call
               # the /responses route, which this endpoint does not serve (502).
               f"      model: hosted_vllm/{x['id']}",
-              f"      api_base: {m['base_url']}",
+              # via nonstream_shim.py: Runpod's streaming path truncates long tool calls and is ~6x slower
+              f"      api_base: http://127.0.0.1:{os.environ['SHIM_PORT']}/v1",
               "      api_key: os.environ/RUNPOD_API_KEY",
               f"      input_cost_per_token: {c['input']/1e6:.10f}",
               f"      output_cost_per_token: {c['output']/1e6:.10f}"]
+    if thinking_off:
+        lines += ["      extra_body:", "        thinking:", "          type: disabled"]
     if c.get("cache_read") is not None:
         lines.append(f"      cache_read_input_token_cost: {c['cache_read']/1e6:.10f}")
 lines += ["litellm_settings:", "  drop_params: true", "  callbacks: strip_thinking.proxy_handler_instance"]
@@ -193,6 +200,8 @@ PY
   # Claude Code echoes the proxy's `thinking` blocks back in history (empty signature). Forwarding them
   # makes Kimi on Runpod return an empty reply, which Claude Code reports as "stream was malformed".
   cat > "$(dirname "$1")/strip_thinking.py" <<'PY'
+import os
+
 from litellm.integrations.custom_logger import CustomLogger
 
 _DROP = ("thinking", "redacted_thinking")
@@ -200,6 +209,8 @@ _DROP = ("thinking", "redacted_thinking")
 
 class StripThinking(CustomLogger):
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+        if os.environ.get("RUNPOD_CODE_THINKING", "off") != "on":
+            data.pop("thinking", None)  # Claude Code's own request; the model config disables it upstream
         msgs = data.get("messages")
         if isinstance(msgs, list):
             cleaned = []
@@ -227,7 +238,7 @@ cmd_claude() {
   command -v "$CLAUDE_BIN" >/dev/null 2>&1 || die "Claude Code CLI ('$CLAUDE_BIN') not found (run: ./runpod-code setup)"
   mkdir -p "$PROXY_HOME"
   local status=0
-  started=0; pid=""   # global on purpose: the EXIT trap reads them after this function returns
+  started=0; pid=""; shim_pid=""   # global on purpose: the EXIT trap reads them after this function returns
   PIDFILE="$PROXY_HOME/proxy.pid"
   if proxy_healthy; then
     # Only reuse a proxy this tool started. A stale or foreign proxy can lack the fixes below
@@ -239,16 +250,19 @@ cmd_claude() {
     fi
   else
     ensure_litellm
+    BASE_URL="$(python3 -I -c 'import json,sys;print(json.load(open(sys.argv[1]))["base_url"])' "$MODELS_JSON")"
+    nohup python3 -I "$DIR/nonstream_shim.py" "$BASE_URL" "$SHIM_PORT" >"$PROXY_HOME/shim.log" 2>&1 &
+    shim_pid=$!
     write_litellm_config "$PROXY_HOME/litellm_config.yaml"
     # run from PROXY_HOME so LiteLLM can import strip_thinking.py next to the config
     ( cd "$PROXY_HOME" && exec nohup "$VENV/bin/litellm" --config "$PROXY_HOME/litellm_config.yaml" \
         --host 127.0.0.1 --port "$PORT" ) >"$PROXY_HOME/proxy.log" 2>&1 &
     pid=$!; started=1; echo "$pid" > "$PIDFILE"
     local i; for i in $(seq 1 60); do proxy_healthy && break; sleep 1; done
-    proxy_healthy || { kill "$pid" 2>/dev/null || true; die "proxy did not start; see $PROXY_HOME/proxy.log"; }
+    proxy_healthy || { kill "$pid" $shim_pid 2>/dev/null || true; die "proxy did not start; see $PROXY_HOME/proxy.log"; }
     echo "Proxy started on 127.0.0.1:$PORT (log: $PROXY_HOME/proxy.log)"
   fi
-  trap 'if [ "$started" = 1 ]; then kill "$pid" 2>/dev/null || true; rm -f "$PIDFILE"; fi' EXIT
+  trap 'if [ "$started" = 1 ]; then kill "$pid" $shim_pid 2>/dev/null || true; rm -f "$PIDFILE"; fi' EXIT
   env ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT" \
       ANTHROPIC_AUTH_TOKEN="local-proxy" \
       ANTHROPIC_MODEL="$model" \
