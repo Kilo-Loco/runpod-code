@@ -1,7 +1,7 @@
 {
   "base_url": "https://api.runpod.ai/v2/moonshot-kimi/openai/v1",
   "default": "kimi-k3.1-pro",
-  "_note": "Prices are USD per 1M tokens from the Runpod Public Endpoint catalog (checked 2026-11-04). cache_read/cache_write are null where Runpod does not publish them and we have not measured them; the tool warns about those. status 'verified' means tested end to end (chat, streaming, tool calling, caching) in this repo's ./verify results.",
+  "_note": "Prices are USD per 1M tokens from the Runpod Public Endpoint catalog (checked 2026-11-04). cache_read/cache_write are null where Runpod does not publish them and we have not measured them; the tool warns about those. status 'verified' means tested end to end (chat, streaming, tool calling, caching, and a Claude Code CLI run through the proxy).",
   "models": [
     {
       "id": "kimi-k3.1-pro",
