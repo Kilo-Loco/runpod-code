@@ -256,6 +256,7 @@ cmd_claude() {
       ANTHROPIC_DEFAULT_SONNET_MODEL="$model" \
       ANTHROPIC_DEFAULT_HAIKU_MODEL="$model" \
       ANTHROPIC_SMALL_FAST_MODEL="$model" \
+      CLAUDE_CODE_AUTO_MODE_SERVER="${CLAUDE_CODE_AUTO_MODE_SERVER:-0}" \
       "$CLAUDE_BIN" "$@" || status=$?
   return "$status"
 }
