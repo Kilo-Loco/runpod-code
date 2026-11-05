@@ -228,20 +228,27 @@ cmd_claude() {
   mkdir -p "$PROXY_HOME"
   local status=0
   started=0; pid=""   # global on purpose: the EXIT trap reads them after this function returns
+  PIDFILE="$PROXY_HOME/proxy.pid"
   if proxy_healthy; then
-    echo "Reusing the proxy already listening on 127.0.0.1:$PORT"
+    # Only reuse a proxy this tool started. A stale or foreign proxy can lack the fixes below
+    # (e.g. strip_thinking) and cause "response stream was malformed".
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+      echo "Reusing the runpod-code proxy already running on 127.0.0.1:$PORT (pid $(cat "$PIDFILE"))"
+    else
+      die "something else is already listening on 127.0.0.1:$PORT and runpod-code did not start it. Stop it, or use another port: RUNPOD_CODE_PORT=4100 ./runpod-code claude"
+    fi
   else
     ensure_litellm
     write_litellm_config "$PROXY_HOME/litellm_config.yaml"
     # run from PROXY_HOME so LiteLLM can import strip_thinking.py next to the config
     ( cd "$PROXY_HOME" && exec nohup "$VENV/bin/litellm" --config "$PROXY_HOME/litellm_config.yaml" \
         --host 127.0.0.1 --port "$PORT" ) >"$PROXY_HOME/proxy.log" 2>&1 &
-    pid=$!; started=1
+    pid=$!; started=1; echo "$pid" > "$PIDFILE"
     local i; for i in $(seq 1 60); do proxy_healthy && break; sleep 1; done
     proxy_healthy || { kill "$pid" 2>/dev/null || true; die "proxy did not start; see $PROXY_HOME/proxy.log"; }
     echo "Proxy started on 127.0.0.1:$PORT (log: $PROXY_HOME/proxy.log)"
   fi
-  trap '[ "$started" = 1 ] && kill "$pid" 2>/dev/null || true' EXIT
+  trap 'if [ "$started" = 1 ]; then kill "$pid" 2>/dev/null || true; rm -f "$PIDFILE"; fi' EXIT
   env ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT" \
       ANTHROPIC_AUTH_TOKEN="local-proxy" \
       ANTHROPIC_MODEL="$model" \
