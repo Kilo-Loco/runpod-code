@@ -43,10 +43,10 @@ Models and prices live in `models.json`. Only `kimi-k3.1-pro` has been tested; t
 
 ## Good to know
 
-- Thinking is off by default. With it on, long reasoning streams were unreliable through the proxy. Turn it on with `RUNPOD_CODE_THINKING=on ./runpod-code claude`.
+- Thinking is on by default. For faster, cheaper replies on easy tasks, turn it off with `RUNPOD_CODE_THINKING=off ./runpod-code claude`.
 - Runpod's streaming path cuts off long responses (a large file write arrives truncated) and is much slower. So a small shim (`nonstream_shim.py`, started automatically) calls the endpoint without streaming and replays the result to Claude Code. Output appears in bursts rather than token by token.
 - Your key is never written into any config. The proxy reads it from `RUNPOD_API_KEY`.
 - The endpoint only serves OpenAI-style `/chat/completions`, so the proxy translates Claude Code's requests. It also strips replayed `thinking` blocks, which otherwise make Kimi return empty replies.
-- Tested on macOS with Claude Code CLI 2.1.311. One run built a complete multi-file web app (about 95KB of HTML, CSS and JS) in about 22 minutes. The LiteLLM install step and a clean-machine run are untested.
+- Tested on macOS with Claude Code CLI 2.1.311. Two runs each built a complete multi-file web app (about 95-100KB of HTML, CSS and JS) in 22-38 minutes, with thinking off and on. The LiteLLM install step and a clean-machine run are untested.
 
 Experimental and community-maintained, not an official Runpod product.

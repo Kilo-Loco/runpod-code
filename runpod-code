@@ -174,9 +174,9 @@ write_litellm_config() {  # $1 = output path
   SHIM_PORT="$SHIM_PORT" python3 -I - "$MODELS_JSON" "$1" <<'PY'
 import json, os, sys
 m = json.load(open(sys.argv[1])); out = sys.argv[2]
-# Thinking is OFF by default: with reasoning on, LiteLLM's Anthropic stream adapter silently ends many
-# streams after a few reasoning tokens ("stream was malformed"). Set RUNPOD_CODE_THINKING=on to enable.
-thinking_off = os.environ.get("RUNPOD_CODE_THINKING", "off") != "on"
+# Thinking is ON by default. RUNPOD_CODE_THINKING=off disables it upstream (faster, cheaper, less reliable
+# on hard tasks).
+thinking_off = os.environ.get("RUNPOD_CODE_THINKING", "on") == "off"
 lines = ["model_list:"]
 for x in m["models"]:
     c = x["cost"]
@@ -209,7 +209,7 @@ _DROP = ("thinking", "redacted_thinking")
 
 class StripThinking(CustomLogger):
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
-        if os.environ.get("RUNPOD_CODE_THINKING", "off") != "on":
+        if os.environ.get("RUNPOD_CODE_THINKING", "on") == "off":
             data.pop("thinking", None)  # Claude Code's own request; the model config disables it upstream
         msgs = data.get("messages")
         if isinstance(msgs, list):
