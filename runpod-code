@@ -76,12 +76,48 @@ ensure_claude() {
   brew install --cask claude-code
 }
 
+# Run a long command with a live one-line status (pip does not report a total, so we show
+# elapsed time and what it is doing rather than a fake percentage). Output goes to a log that is
+# shown only if the command fails. Without a terminal it prints a heartbeat line every 15s instead.
+run_with_progress() {  # run_with_progress "label" cmd args...
+  local label="$1"; shift
+  local log; log="$(mktemp)"
+  "$@" >"$log" 2>&1 &
+  local pid=$! start=$SECONDS i=0 frames='|/-\' last=0
+  while kill -0 "$pid" 2>/dev/null; do
+    local el=$(( SECONDS - start )) found installing cur msg cols
+    found="$(grep -c '^Collecting ' "$log" 2>/dev/null || true)"
+    installing="$(grep -m1 '^Installing collected packages' "$log" 2>/dev/null | tr ',' '\n' | wc -l | tr -d ' ')"
+    if [ -n "$installing" ] && [ "$installing" -gt 0 ]; then
+      msg="installing $installing packages (no per-package progress from pip)"
+    else
+      cur="$(grep -E '^ *Downloading ' "$log" 2>/dev/null | tail -1 | sed -E 's/^ *Downloading //; s/ \(([^)]*)\).*/ (\1)/')"
+      msg="${found:-0} packages found${cur:+, downloading $cur}"
+    fi
+    if [ -t 1 ]; then
+      cols="$(tput cols 2>/dev/null || echo 100)"
+      printf '\r\033[K%.*s' $(( cols - 1 )) "  ${frames:i%4:1} $label  $(( el / 60 ))m$(printf '%02d' $(( el % 60 )))s  $msg"
+      i=$(( i + 1 )); sleep 0.2
+    else
+      if [ $(( el - last )) -ge 15 ]; then echo "  $label: still working (${el}s, $msg)"; last=$el; fi
+      sleep 1
+    fi
+  done
+  local status=0; wait "$pid" || status=$?
+  [ -t 1 ] && printf '\r\033[K'
+  if [ "$status" -ne 0 ]; then
+    echo "$label failed (exit $status). Last lines of the log:" >&2; tail -n 15 "$log" >&2; rm -f "$log"; return "$status"
+  fi
+  echo "  $label: done in $(( SECONDS - start ))s"; rm -f "$log"
+}
+
 ensure_litellm() {
   [ -x "$VENV/bin/litellm" ] && return 0
   echo "The Anthropic-to-OpenAI proxy (LiteLLM) is not installed in $VENV."
   confirm "Create that virtualenv and pip install 'litellm[proxy]' (large download)?" || die "LiteLLM is required"
   python3 -m venv "$VENV"
-  "$VENV/bin/pip" install -q --disable-pip-version-check 'litellm[proxy]'
+  run_with_progress "Installing LiteLLM" "$VENV/bin/pip" install --disable-pip-version-check --no-color 'litellm[proxy]' \
+    || die "could not install litellm"
 }
 
 cmd_setup() {
