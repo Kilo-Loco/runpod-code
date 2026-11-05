@@ -16,7 +16,7 @@ cd runpod-code
 
 Paste your key when asked. Setup checks the key and installs anything missing, after asking: the [Claude Code CLI](https://code.claude.com/docs) (via Homebrew) and a small local proxy (LiteLLM, in its own virtualenv).
 
-**3. Start Claude Code on Kimi.** Open a new terminal tab (so the saved key loads), go to your project, and run:
+**3. Start Claude Code on Kimi.** Go to your project and run (no new terminal tab needed; the saved key is found automatically):
 
 ```bash
 /path/to/runpod-code/runpod-code claude

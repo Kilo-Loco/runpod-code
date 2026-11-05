@@ -50,6 +50,16 @@ obtain_key() {
 }
 
 # The key is passed to curl through stdin so it never appears in the process list.
+# A shell only reads ~/.zshenv when it starts, so a tab opened before `setup` ran does not have the key.
+# Fall back to the line setup saved. Only plain key characters are accepted; nothing is eval'd.
+load_saved_key() {
+  [ -n "${RUNPOD_API_KEY:-}" ] && return 0
+  local v; v="$(sed -n 's/^export RUNPOD_API_KEY=//p' "$ENV_FILE" 2>/dev/null | tail -1)"
+  v="${v#[\"\']}"; v="${v%[\"\']}"
+  case "$v" in ''|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+  RUNPOD_API_KEY="$v"; export RUNPOD_API_KEY
+}
+
 auth_curl() { printf 'header = "Authorization: Bearer %s"\n' "$RUNPOD_API_KEY" | curl -sS -K - -m 25 "$@"; }
 
 validate_key() {
@@ -67,7 +77,7 @@ persist_key() {
     echo "$ENV_FILE already defines RUNPOD_API_KEY; leaving it unchanged."; return 0
   fi
   ( umask 077; printf 'export RUNPOD_API_KEY=%q\n' "$RUNPOD_API_KEY" >> "$ENV_FILE" )
-  echo "Saved RUNPOD_API_KEY to $ENV_FILE (open a new terminal tab to pick it up)."
+  echo "Saved RUNPOD_API_KEY to $ENV_FILE (runpod-code will find it; other tools need a new terminal tab)."
 }
 
 ensure_claude() {
@@ -157,6 +167,7 @@ for x in m["models"]:
     print(f"{x['id']:26} {c['input']:>5}/{c['output']:<7}  {('-' if cr is None else cr):>10}  {x['status']}{star}")
 PY
   if [ "${1:-}" = "--live" ]; then
+    load_saved_key || true
     [ -n "${RUNPOD_API_KEY:-}" ] || die "--live needs RUNPOD_API_KEY"
     auth_curl "$BASE_URL/models" | python3 -I -c '
 import json, sys
@@ -234,6 +245,7 @@ cmd_claude() {
   local model="$DEFAULT_MODEL"
   if [ "${1:-}" = "--model" ]; then model="${2:?--model needs an id}"; shift 2; fi
   check_model "$model"
+  load_saved_key || true
   [ -n "${RUNPOD_API_KEY:-}" ] || die "RUNPOD_API_KEY is not set (run: ./runpod-code setup)"
   command -v "$CLAUDE_BIN" >/dev/null 2>&1 || die "Claude Code CLI ('$CLAUDE_BIN') not found (run: ./runpod-code setup)"
   mkdir -p "$PROXY_HOME"
@@ -252,7 +264,7 @@ cmd_claude() {
     ensure_litellm
     BASE_URL="$(python3 -I -c 'import json,sys;print(json.load(open(sys.argv[1]))["base_url"])' "$MODELS_JSON")"
     nohup python3 -I "$DIR/nonstream_shim.py" "$BASE_URL" "$SHIM_PORT" >"$PROXY_HOME/shim.log" 2>&1 &
-    shim_pid=$!
+    shim_pid=$!; disown "$shim_pid" 2>/dev/null || true   # no "Terminated" noise on exit
     write_litellm_config "$PROXY_HOME/litellm_config.yaml"
     # run from PROXY_HOME so LiteLLM can import strip_thinking.py next to the config
     ( cd "$PROXY_HOME" && exec nohup "$VENV/bin/litellm" --config "$PROXY_HOME/litellm_config.yaml" \
