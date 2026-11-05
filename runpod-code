@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# runpod-code: set up coding agents (OpenCode, Claude Code) against Kimi models on
+# Runpod Public Endpoints. Models and prices live in models.json next to this script.
+#
+#   runpod-code setup  [--model ID] [--yes] [--save-key] [--skip-validate]
+#   runpod-code models [--live]
+#   runpod-code claude [--model ID] [claude args...]
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MODELS_JSON="${RUNPOD_CODE_MODELS:-$DIR/models.json}"
+OC_CONFIG="${RUNPOD_CODE_OPENCODE_CONFIG:-$HOME/.config/opencode/opencode.json}"
+ENV_FILE="${RUNPOD_CODE_ENV_FILE:-$HOME/.zshenv}"
+PROXY_HOME="${RUNPOD_CODE_HOME:-$HOME/.local/share/runpod-code}"
+VENV="${RUNPOD_CODE_VENV:-$PROXY_HOME/venv}"
+PORT="${RUNPOD_CODE_PORT:-4000}"
+CLAUDE_BIN="${RUNPOD_CODE_CLAUDE_BIN:-claude}"
+
+die()  { echo "error: $*" >&2; exit 1; }
+warn() { echo "warning: $*" >&2; }
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required but was not found"; }
+
+[ -f "$MODELS_JSON" ] || die "models file not found: $MODELS_JSON"
+need python3
+need curl
+
+jget() { python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$MODELS_JSON" "$1"; }
+BASE_URL="$(jget base_url)"
+DEFAULT_MODEL="$(jget default)"
+
+confirm() {  # confirm "question"  (auto-yes with --yes)
+  [ "${ASSUME_YES:-0}" = 1 ] && return 0
+  [ -t 0 ] || return 1
+  local a; read -r -p "$1 [Y/n] " a; case "${a:-Y}" in [Yy]*) return 0 ;; *) return 1 ;; esac
+}
+
+check_model() {
+  python3 -I -c 'import json,sys
+ids=[m["id"] for m in json.load(open(sys.argv[1]))["models"]]
+sys.exit(0 if sys.argv[2] in ids else 1)' "$MODELS_JSON" "$1" || die "unknown model '$1' (see: runpod-code models)"
+}
+
+obtain_key() {
+  KEY_FROM_PROMPT=0
+  [ -n "${RUNPOD_API_KEY:-}" ] && return 0
+  [ -t 0 ] || die "RUNPOD_API_KEY is not set and there is no terminal to prompt on"
+  printf 'Paste your Runpod API key (input is hidden): ' >&2
+  read -rs RUNPOD_API_KEY; echo >&2
+  [ -n "$RUNPOD_API_KEY" ] || die "no key entered"
+  export RUNPOD_API_KEY; KEY_FROM_PROMPT=1
+}
+
+# The key is passed to curl through stdin so it never appears in the process list.
+auth_curl() { printf 'header = "Authorization: Bearer %s"\n' "$RUNPOD_API_KEY" | curl -sS -K - -m 25 "$@"; }
+
+validate_key() {
+  local code
+  code="$(auth_curl -o /dev/null -w '%{http_code}' https://api.runpod.io/v2/pods)" || { warn "could not reach Runpod to validate the key"; return 0; }
+  case "$code" in
+    200) echo "Runpod API key accepted." ;;
+    401) die "Runpod rejected the API key (HTTP 401)" ;;
+    *)   warn "key check returned HTTP $code (a restricted key can cause this); continuing" ;;
+  esac
+}
+
+persist_key() {
+  if grep -qs '^export RUNPOD_API_KEY=' "$ENV_FILE" 2>/dev/null; then
+    echo "$ENV_FILE already defines RUNPOD_API_KEY; leaving it unchanged."; return 0
+  fi
+  ( umask 077; printf 'export RUNPOD_API_KEY=%q\n' "$RUNPOD_API_KEY" >> "$ENV_FILE" )
+  echo "Saved RUNPOD_API_KEY to $ENV_FILE (open a new terminal tab to pick it up)."
+}
+
+write_opencode_config() {  # $1 = default model id
+  mkdir -p "$(dirname "$OC_CONFIG")"
+  [ -f "$OC_CONFIG" ] && cp "$OC_CONFIG" "$OC_CONFIG.bak" && echo "Existing config backed up to $OC_CONFIG.bak"
+  python3 -I - "$MODELS_JSON" "$OC_CONFIG" "$1" <<'PY'
+import json, os, sys
+models_path, out, default = sys.argv[1:4]
+m = json.load(open(models_path))
+models = {}
+for x in m["models"]:
+    c = x["cost"]
+    cost = {"input": c["input"], "output": c["output"]}
+    for k in ("cache_read", "cache_write"):
+        if c.get(k) is not None:
+            cost[k] = c[k]
+        else:
+            print(f"warning: {x['id']} has no {k} price; cached tokens will be costed at 0 in OpenCode", file=sys.stderr)
+    models[x["id"]] = {"name": x["name"], "cost": cost}
+cfg = json.load(open(out)) if os.path.exists(out) else {}
+cfg.setdefault("$schema", "https://opencode.ai/config.json")
+cfg.setdefault("provider", {})["runpod"] = {
+    "npm": "@ai-sdk/openai-compatible",
+    "name": "Runpod",
+    "options": {"baseURL": m["base_url"], "apiKey": "{env:RUNPOD_API_KEY}"},
+    "models": models,
+}
+cfg["model"] = "runpod/" + default
+json.dump(cfg, open(out, "w"), indent=2); open(out, "a").write("\n")
+PY
+  echo "Wrote OpenCode config: $OC_CONFIG (default model: runpod/$1)"
+}
+
+cmd_setup() {
+  local model="$DEFAULT_MODEL" save=0 skip=0 noinstall=0
+  ASSUME_YES=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --model) model="${2:?--model needs an id}"; shift 2 ;;
+    --yes|-y) ASSUME_YES=1; shift ;;
+    --save-key) save=1; shift ;;
+    --skip-validate) skip=1; shift ;;
+    --no-install) noinstall=1; shift ;;
+    *) die "unknown option: $1" ;; esac; done
+  check_model "$model"
+  obtain_key
+  [ "$skip" = 1 ] || validate_key
+  if [ "$KEY_FROM_PROMPT" = 1 ] || [ "$save" = 1 ]; then
+    if [ "$save" = 1 ] || confirm "Save the key to $ENV_FILE so new terminals have it?"; then persist_key; fi
+  fi
+  if ! command -v opencode >/dev/null 2>&1; then
+    [ "$noinstall" = 1 ] && die "opencode is not installed (skipped install)"
+    command -v brew >/dev/null 2>&1 || die "opencode is not installed and Homebrew was not found; see https://opencode.ai"
+    confirm "Install OpenCode with 'brew install opencode'?" || die "OpenCode is required"
+    brew install opencode
+  fi
+  write_opencode_config "$model"
+  # OpenCode 2.x keeps a background service. In our tests a service started before the config
+  # existed made `opencode run` hang until it was restarted, so restart it (best effort).
+  opencode service restart >/dev/null 2>&1 || true
+  echo
+  echo "Done. Start a session with:  opencode"
+  echo "Costs: run 'opencode run --format json \"task\"' and sum the step_finish cost fields, or check the Runpod billing page."
+}
+
+cmd_models() {
+  python3 -I - "$MODELS_JSON" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+print(f"{'id':26} {'in/out $/1M':>13}  {'cache read':>10}  status")
+for x in m["models"]:
+    c = x["cost"]; cr = c.get("cache_read")
+    star = " (default)" if x["id"] == m["default"] else ""
+    print(f"{x['id']:26} {c['input']:>5}/{c['output']:<7}  {('-' if cr is None else cr):>10}  {x['status']}{star}")
+PY
+  if [ "${1:-}" = "--live" ]; then
+    [ -n "${RUNPOD_API_KEY:-}" ] || die "--live needs RUNPOD_API_KEY"
+    auth_curl "$BASE_URL/models" | python3 -I -c '
+import json, sys
+live = {x["id"] for x in json.load(sys.stdin)["data"]}
+known = {x["id"] for x in json.load(open(sys.argv[1]))["models"]}
+print("\nlive endpoint models:", ", ".join(sorted(live)))
+for i in sorted(live - known): print("  NEW (not in models.json, no price):", i)
+for i in sorted(known - live): print("  MISSING from endpoint:", i)' "$MODELS_JSON"
+  fi
+}
+
+proxy_healthy() { curl -s -m 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health/liveliness" 2>/dev/null | grep -q 200; }
+
+ensure_litellm() {
+  [ -x "$VENV/bin/litellm" ] && return 0
+  echo "The Anthropic-to-OpenAI proxy (LiteLLM) is not installed in $VENV."
+  confirm "Create that virtualenv and pip install 'litellm[proxy]' (large download)?" || die "LiteLLM is required for Claude Code"
+  python3 -m venv "$VENV"
+  "$VENV/bin/pip" install -q --disable-pip-version-check 'litellm[proxy]'
+}
+
+write_litellm_config() {  # $1 = output path
+  python3 -I - "$MODELS_JSON" "$1" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1])); out = sys.argv[2]
+lines = ["model_list:"]
+for x in m["models"]:
+    c = x["cost"]
+    lines += [f"  - model_name: {x['id']}",
+              "    litellm_params:",
+              # hosted_vllm (chat completions) on purpose: the openai/ prefix makes LiteLLM call
+              # the /responses route, which this endpoint does not serve (502).
+              f"      model: hosted_vllm/{x['id']}",
+              f"      api_base: {m['base_url']}",
+              "      api_key: os.environ/RUNPOD_API_KEY",
+              f"      input_cost_per_token: {c['input']/1e6:.10f}",
+              f"      output_cost_per_token: {c['output']/1e6:.10f}"]
+    if c.get("cache_read") is not None:
+        lines.append(f"      cache_read_input_token_cost: {c['cache_read']/1e6:.10f}")
+lines += ["litellm_settings:", "  drop_params: true", "  callbacks: strip_thinking.proxy_handler_instance"]
+open(out, "w").write("\n".join(lines) + "\n")
+PY
+  # Claude Code echoes the proxy's `thinking` blocks back in history (empty signature). Forwarding them
+  # makes Kimi on Runpod return an empty reply, which Claude Code reports as "stream was malformed".
+  cat > "$(dirname "$1")/strip_thinking.py" <<'PY'
+from litellm.integrations.custom_logger import CustomLogger
+
+_DROP = ("thinking", "redacted_thinking")
+
+
+class StripThinking(CustomLogger):
+    async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+        msgs = data.get("messages")
+        if isinstance(msgs, list):
+            cleaned = []
+            for m in msgs:
+                c = m.get("content") if isinstance(m, dict) else None
+                if isinstance(c, list):
+                    c = [b for b in c if not (isinstance(b, dict) and b.get("type") in _DROP)]
+                    if not c and m.get("role") == "assistant":
+                        continue
+                    m = {**m, "content": c}
+                cleaned.append(m)
+            data["messages"] = cleaned
+        return data
+
+
+proxy_handler_instance = StripThinking()
+PY
+}
+
+cmd_claude() {
+  local model="$DEFAULT_MODEL"
+  if [ "${1:-}" = "--model" ]; then model="${2:?--model needs an id}"; shift 2; fi
+  check_model "$model"
+  [ -n "${RUNPOD_API_KEY:-}" ] || die "RUNPOD_API_KEY is not set"
+  command -v "$CLAUDE_BIN" >/dev/null 2>&1 || die "Claude Code CLI ('$CLAUDE_BIN') not found. Install it (https://code.claude.com/docs) and retry."
+  mkdir -p "$PROXY_HOME"
+  local status=0
+  started=0; pid=""   # global on purpose: the EXIT trap reads them after this function returns
+  if proxy_healthy; then
+    echo "Reusing the proxy already listening on 127.0.0.1:$PORT"
+  else
+    ensure_litellm
+    write_litellm_config "$PROXY_HOME/litellm_config.yaml"
+    # run from PROXY_HOME so LiteLLM can import strip_thinking.py next to the config
+    ( cd "$PROXY_HOME" && exec nohup "$VENV/bin/litellm" --config "$PROXY_HOME/litellm_config.yaml" \
+        --host 127.0.0.1 --port "$PORT" ) >"$PROXY_HOME/proxy.log" 2>&1 &
+    pid=$!; started=1
+    local i; for i in $(seq 1 60); do proxy_healthy && break; sleep 1; done
+    proxy_healthy || { kill "$pid" 2>/dev/null || true; die "proxy did not start; see $PROXY_HOME/proxy.log"; }
+    echo "Proxy started on 127.0.0.1:$PORT (log: $PROXY_HOME/proxy.log)"
+  fi
+  trap '[ "$started" = 1 ] && kill "$pid" 2>/dev/null || true' EXIT
+  env ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT" \
+      ANTHROPIC_AUTH_TOKEN="local-proxy" \
+      ANTHROPIC_MODEL="$model" \
+      ANTHROPIC_DEFAULT_OPUS_MODEL="$model" \
+      ANTHROPIC_DEFAULT_SONNET_MODEL="$model" \
+      ANTHROPIC_DEFAULT_HAIKU_MODEL="$model" \
+      ANTHROPIC_SMALL_FAST_MODEL="$model" \
+      "$CLAUDE_BIN" "$@" || status=$?
+  return "$status"
+}
+
+case "${1:-help}" in
+  setup)  shift; cmd_setup "$@" ;;
+  models) shift; cmd_models "$@" ;;
+  claude) shift; cmd_claude "$@" ;;
+  *) sed -n '2,7p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+esac

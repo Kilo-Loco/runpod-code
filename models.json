@@ -1,0 +1,37 @@
+{
+  "base_url": "https://api.runpod.ai/v2/moonshot-kimi/openai/v1",
+  "default": "kimi-k3.1-pro",
+  "_note": "Prices are USD per 1M tokens from the Runpod Public Endpoint catalog (checked 2026-11-04). cache_read/cache_write are null where Runpod does not publish them and we have not measured them; the tool warns about those. status 'verified' means tested end to end (chat, streaming, tool calling, caching) in this repo's ./verify results.",
+  "models": [
+    {
+      "id": "kimi-k3.1-pro",
+      "name": "Kimi K3.1 Pro",
+      "status": "verified",
+      "cost": { "input": 2.0, "output": 10.0, "cache_read": 0.2, "cache_write": 2.0 }
+    },
+    {
+      "id": "kimi-k3.1-pro-highspeed",
+      "name": "Kimi K3.1 Pro Highspeed",
+      "status": "untested",
+      "cost": { "input": 4.0, "output": 20.0, "cache_read": null, "cache_write": null }
+    },
+    {
+      "id": "kimi-k3",
+      "name": "Kimi K3",
+      "status": "untested",
+      "cost": { "input": 3.0, "output": 15.0, "cache_read": null, "cache_write": null }
+    },
+    {
+      "id": "kimi-k2.7-code",
+      "name": "Kimi K2.7 Code",
+      "status": "untested",
+      "cost": { "input": 0.95, "output": 4.0, "cache_read": null, "cache_write": null }
+    },
+    {
+      "id": "kimi-k2.6",
+      "name": "Kimi K2.6",
+      "status": "untested",
+      "cost": { "input": 0.95, "output": 4.0, "cache_read": null, "cache_write": null }
+    }
+  ]
+}
