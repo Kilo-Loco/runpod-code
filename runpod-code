@@ -308,9 +308,22 @@ cmd_claude() {
     echo "Proxy started on 127.0.0.1:$PORT (log: $PROXY_HOME/proxy.log)"
   fi
   trap 'if [ "$started" = 1 ]; then kill "$pid" $shim_pid 2>/dev/null || true; rm -f "$PIDFILE" "$MASTER_FILE"; fi' EXIT
+  # Claude Code assumes 200k tokens for models it doesn't know and compacts early. Public Kimi models
+  # accept far more (an 800k-token prompt was accepted), so declare a 1M window with [1m] (stripped before
+  # the request is sent) and compact at 400k. A custom endpoint is capped at its own max_model_len instead.
+  local ctx model_env="$model" compact_window="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-}"
+  ctx=$(python3 -I -c 'import json,sys
+for m in json.load(open(sys.argv[1]))["models"]:
+    if m["id"]==sys.argv[2] and m.get("max_model_len"): print(int(m["max_model_len"]))' "$MODELS_JSON" "$model" 2>/dev/null || true)
+  if [ -n "$ctx" ]; then
+    [ -n "$compact_window" ] || compact_window=$(( ctx > 200000 ? 200000 : ctx * 85 / 100 ))
+  else
+    model_env="$model[1m]"; [ -n "$compact_window" ] || compact_window=400000
+  fi
   env ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT" \
       ANTHROPIC_AUTH_TOKEN="$master" \
-      ANTHROPIC_MODEL="$model" \
+      ANTHROPIC_MODEL="$model_env" \
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW="$compact_window" \
       ANTHROPIC_DEFAULT_OPUS_MODEL="$model" \
       ANTHROPIC_DEFAULT_SONNET_MODEL="$model" \
       ANTHROPIC_DEFAULT_HAIKU_MODEL="$model" \

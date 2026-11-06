@@ -75,6 +75,9 @@ def merge(builtin_path, user_path, out_path, routes_path):
              "base_url": url.rstrip("/"), "upstream_model": u.get("upstream_model", uid),
              "billing": u.get("billing", "gpu-seconds"),
              "cost": u.get("cost") or {"input": 0.0, "output": 0.0, "cache_read": None, "cache_write": None}}
+        ml = u.get("max_model_len")
+        if isinstance(ml, int) and not isinstance(ml, bool) and ml > 0:
+            m["max_model_len"] = ml
         models = [x for x in models if x["id"] != uid] + [m]
     data["models"] = models
     write_json(out_path, data)
